@@ -362,7 +362,7 @@ have_aur_helper() {
 	have_native_cmd "$AUR_HELPER"
 }
 
-# One-time bootstrap: base-devel + git, then makepkg paru-bin from the AUR
+# One-time bootstrap: base-devel + git, then makepkg paru from the AUR
 # into a throwaway clone. makepkg runs as the invoking user; its final
 # `pacman -U` shells out to sudo itself, which the temporary NOPASSWD
 # drop-in already covers. Never run the helper itself under sudo_cmd —
@@ -388,24 +388,42 @@ _ensure_aur_variant() {
 	return "$rc"
 }
 
+# Clear the helper slot so the source build installs as if fresh: whatever
+# package owns the dead helper binary (paru, paru-bin, ...) is removed.
+# Without this the SOURCE paru can never take over — paru and paru-bin are
+# declared in conflict, so makepkg's final `pacman -U paru` aborts with
+# "unresolvable package conflicts" while the dead variant stays behind. Ownership is DISCOVERED via pacman -Qo, not
+# hardcoded: paru-bin ships its binary as /usr/bin/paru too, so the broken
+# install is not always named "paru". makepkg -si also installs the empty
+# "-debug" twin when it exists; it goes with the owner. Best-effort: a
+# failed removal must not stop the installer.
+_remove_dead_aur_helper_pkg() {
+	local bin owner
+	bin=$(command -v "$1" 2>/dev/null) || return 0
+	owner=$(pacman -Qoq "$bin" 2>/dev/null | head -n1) || return 0
+	[ -n "$owner" ] || return 0
+	local -a names=("$owner")
+	pacman -Qi "${owner}-debug" >/dev/null 2>&1 && names+=("${owner}-debug")
+	sudo_cmd pacman -Rns --noconfirm ${names[@]+"${names[@]}"} || true
+	return 0
+}
+
 ensure_aur_helper() {
-	# A -bin paru breaks whenever the system libalpm outgrows the SONAME the
-	# PREBUILT binary was linked against (a pacman update → "libalpm.so.15:
-	# cannot open shared object file"). Existing-but-dead must be REBUILT,
-	# not adopted — and because the -bin PKGBUILD downloads an upstream
-	# PREBUILT binary, rebuilding it re-downloads the SAME mismatched binary
-	# (the rebuild that did not cure the breakage, arch 2026-11). The ladder
-	# is therefore: paru-bin first (no Rust toolchain), functional check,
-	# and on failure the SOURCE paru — linked against the local libalpm at
-	# the cost of pulling Rust as a makedepends.
+	# The -bin paru is a PREBUILT upstream binary: it breaks whenever the
+	# system libalpm outgrows the SONAME it was linked against (a pacman
+	# update → "libalpm.so.15: cannot open shared object file"), and
+	# rebuilding it merely re-downloads the SAME mismatched binary.
+	# The SOURCE paru links against the local libalpm and
+	# cannot have that failure mode.
 	if have_aur_helper && "$AUR_HELPER" --version >/dev/null 2>&1; then
 		return 0
 	fi
 	[ "$OS" = arch ] || return 1
 	if have_aur_helper; then
-		warn "$AUR_HELPER exists but cannot run (system libalpm moved past its build?) — rebuilding..."
+		warn "$AUR_HELPER exists but cannot run (system libalpm moved past its build?) — removing it and building from source..."
+		_remove_dead_aur_helper_pkg "$AUR_HELPER"
 	else
-		info "installing $AUR_HELPER (AUR helper)..."
+		info "installing $AUR_HELPER (AUR helper) from source..."
 	fi
 	# makepkg's base: base-devel is a package GROUP, not a package — a
 	# pacman -Si probe cannot vouch for it, so this install goes straight
@@ -413,20 +431,14 @@ ensure_aur_helper() {
 	# keeps it a no-op on a machine that already has the toolchain.
 	refresh_pkg
 	retry -t 1800 -s "pacman install base-devel git" sudo_cmd pacman -S --needed --noconfirm base-devel git || return 1
-	local variant rc=1
-	for variant in paru-bin "$AUR_HELPER"; do
-		_ensure_aur_variant "$variant" || continue
-		if have_aur_helper && "$AUR_HELPER" --version >/dev/null 2>&1; then
-			rc=0
-			break
-		fi
-		warn "$variant was installed but cannot run (libalpm SONAME mismatch?) — trying the next variant..."
-	done
+	local rc=0
+	_ensure_aur_variant "$AUR_HELPER" || rc=$?
 	hash -r
-	if [ "$rc" -eq 0 ]; then
+	if [ "$rc" -eq 0 ] && have_aur_helper && "$AUR_HELPER" --version >/dev/null 2>&1; then
 		ok "$AUR_HELPER ready."
 	else
-		warn "$AUR_HELPER still not available after every variant."
+		rc=1
+		warn "$AUR_HELPER is still not available."
 	fi
 	return "$rc"
 }
