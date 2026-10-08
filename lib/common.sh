@@ -112,7 +112,7 @@ _retry_run() {
 		# call die with "command not found" inside the child (observed on
 		# openSUSE: sudo_cmd -> native_sudo -> have_native_cmd ->
 		# native_bin_path, which the old whitelist did not carry).
-		for fn in "$1" retry _retry_run native_sudo have_native_cmd native_bin_path is_wsl; do
+		for fn in "$1" retry _retry_run native_sudo have_native_cmd native_bin_path is_wsl warn; do
 			# export -f: export the FUNCTION named by $fn's value (dynamic
 			# by design — the wrapped command may be a framework function).
 			declare -F "$fn" >/dev/null 2>&1 && export -f "$fn"
@@ -640,9 +640,10 @@ version_ge() {
 # behind CAP_SYS_ADMIN (CONFIG_LEGACY_TIOCSTI off — WSL2 ships it off),
 # which root carries in the initial namespace, so the sudo run works on
 # gated and ungated kernels alike, silently under the installer's NOPASSWD
-# drop-in. The controlling terminal survives sudo, so the keys land in the
-# same terminal. python3 first, perl as fallback, plain error when both
-# are missing.
+# drop-in. The TARGET tty is resolved by path (TIOCSTI_TTY from the reader
+# guard), never "/dev/tty": sudo >= 1.9.14 runs the command in its own pty
+# by default (use_pty), and /dev/tty inside the child is that private pty —
+# bytes injected there die with sudo. python3 first, perl as fallback, plain error when both are missing.
 
 # ────────────────────── interactive-reader guard ──────────────────────
 # A succeeding TIOCSTI ioctl only proves the bytes entered the tty input
@@ -669,7 +670,19 @@ _is_interactive_shell() {
 	# launched bare (`zsh`, `-zsh`, `zsh -i`), so this never bites in
 	# practice.
 	local -a words
-	read -r -a words <<<"$(ps -ww -o args= -p "$1" 2>/dev/null)"
+	# NB: two statements, not `read <<<"$(...)"` — and the input goes
+	# through a plain heredoc, not a herestring. Legacy sh.vim (nvim/vim
+	# without tree-sitter for sh — the built-in fallback) parses `<<<` as a
+	# heredoc BEGIN whose delimiter is the rest of the line; that delimiter
+	# never matches a line, so EVERY following line renders as one
+	# unterminated heredoc (observed: the rest of this file highlighted as
+	# shHereDoc from _is_interactive_shell down, 2026-10). `read -a` splits
+	# on IFS whitespace exactly as the herestring did.
+	local ps_out
+	ps_out=$(ps -ww -o args= -p "$1" 2>/dev/null)
+	read -r -a words <<EOF
+$ps_out
+EOF
 	((${#words[@]} > 0)) || return 1
 	local prog="${words[0]##*/}" a
 	prog="${prog#-}" # login shells carry a leading dash ("-zsh")
@@ -707,8 +720,15 @@ _has_interactive_reader() {
 	command -v ps >/dev/null 2>&1 || return 0
 	local my_tty pid ppid fd0 n=0
 	# The tty the queued bytes must land in: OUR controlling terminal.
+	# Exported as TIOCSTI_TTY for inject_tty, which must NOT reopen
+	# /dev/tty under sudo: sudo >= 1.9.14 runs the command in its OWN pty
+	# by default (use_pty), so /dev/tty inside the child is sudo's private
+	# pty — the injected bytes then land in a queue that dies with sudo
+	# while the ioctl still returns 0. The REAL tty device path is immune to that.
 	my_tty=$(ps -o tty= -p "$$" 2>/dev/null)
 	my_tty="${my_tty//[[:space:]]/}"
+	TIOCSTI_TTY=""
+	[ -n "$my_tty" ] && TIOCSTI_TTY="/dev/$my_tty"
 	pid=$$
 	# Diagnostic breadcrumbs for the log file inject_tty keeps: WHO the walk
 	# trusted as the reader, and which ancestors it inspected and rejected.
@@ -782,8 +802,15 @@ inject_tty() {
 	# injection is prefixed with sudo — root carries the capability,
 	# and the NOPASSWD drop-in keeps it silent during installs.
 	#   macOS: no gate — plain run; sudo would only add a password prompt.
-	# The controlling terminal survives sudo, so the keys land in the same
-	# terminal either way.
+	# The TARGET is never "/dev/tty" under sudo: sudo >= 1.9.14 runs the
+	# command in its own pty by default (use_pty), and /dev/tty inside the
+	# child is that private pty — bytes injected there die with sudo (rc=0
+	# regardless, which is how the silent no-op slipped past every check).
+	# TIOCSTI_TTY names the installer's REAL controlling tty (resolved by
+	# the guard above); root may TIOCSTI any tty it can open, and without
+	# sudo the real tty IS the controlling terminal — correct on both
+	# paths. /dev/tty stays the fallback when no tty could be resolved.
+	local target="${TIOCSTI_TTY:-/dev/tty}"
 	local -a runner=()
 	if [ "$(uname -s)" != Darwin ] && have_native_cmd sudo; then
 		runner=(sudo_cmd)
@@ -794,24 +821,24 @@ inject_tty() {
 		# termios.TIOCSTI carries the per-platform constant automatically.
 		if err=$(${runner[@]+"${runner[@]}"} "$py3" -c 'import sys,os,fcntl,termios
 cmd = sys.argv[1] + "\n"
-fd = os.open("/dev/tty", os.O_WRONLY)
+fd = os.open(sys.argv[2], os.O_WRONLY)
 for b in cmd.encode():
     buf = bytearray(1); buf[0] = b
-    fcntl.ioctl(fd, termios.TIOCSTI, buf)' "$cmd" 2>&1); then
-			_tiocsti_log "INJECT reader='${TIOCSTI_READER_DESC:-}' cmd='$cmd' via=python3 rc=0"
+    fcntl.ioctl(fd, termios.TIOCSTI, buf)' "$cmd" "$target" 2>&1); then
+			_tiocsti_log "INJECT reader='${TIOCSTI_READER_DESC:-}' tty=$target cmd='$cmd' via=python3 rc=0"
 			ok "injected${label}."
 			return 0
 		fi
 	fi
 	if [ -n "$perlx" ]; then
 		if err=$(${runner[@]+"${runner[@]}"} "$perlx" -e '
-			my ($cmd, $tio) = @ARGV;
-			open(my $tty, ">", "/dev/tty") or die "open /dev/tty: $!\n";
+			my ($cmd, $tio, $tty_path) = @ARGV;
+			open(my $tty, ">", $tty_path) or die "open $tty_path: $!\n";
 			for my $ch (split //, $cmd . "\n") {
 				ioctl($tty, hex($tio), $ch) or die "TIOCSTI ioctl failed: $!\n";
 			}
-		' "$cmd" "$tiocsti" 2>&1); then
-			_tiocsti_log "INJECT reader='${TIOCSTI_READER_DESC:-}' cmd='$cmd' via=perl rc=0"
+		' "$cmd" "$tiocsti" "$target" 2>&1); then
+			_tiocsti_log "INJECT reader='${TIOCSTI_READER_DESC:-}' tty=$target cmd='$cmd' via=perl rc=0"
 			ok "injected${label}."
 			return 0
 		fi
