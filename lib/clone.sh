@@ -128,6 +128,12 @@ preseed_path() {
 run_checkhealth() {
 	preseed_path
 	info "Running checkhealth.sh --install to install remaining dependencies..."
+	# Chain marker: a chained --install keeps the NOPASSWD drop-in default —
+	# the installer's own setup_sudo has already granted, and long chained
+	# runs need it (see checkhealth_main in checkhealth.sh). Manual runs
+	# default to timestamp-only authentication.
+	INSTALL_CHAIN=1
+	export INSTALL_CHAIN
 	if retry -t 3600 -s "checkhealth" bash "$INSTALL_DIR/checkhealth.sh" --install --skip-check-config; then
 		ok "Dependency check complete."
 	else
