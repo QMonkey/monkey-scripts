@@ -32,31 +32,48 @@ _kmscon_parse_ttys() {
 		case "$tok" in
 		tty[0-9]*) n=${tok#tty} ;;
 		[0-9]*) n=$tok ;;
-		*) warn "ensure_kmscon: invalid tty '$tok' — expected ttyN (e.g. tty2) — skipping."
-			return 1 ;;
+		*)
+			warn "ensure_kmscon: invalid tty '$tok' — expected ttyN (e.g. tty2) — skipping."
+			return 1
+			;;
 		esac
 		{ [ "$n" -ge 1 ] && [ "$n" -le 63 ]; } ||
-			{ warn "ensure_kmscon: tty$n out of range — the kernel supports tty1..tty63 (MAX_NR_CONSOLES) — skipping."
-				return 1; }
+			{
+				warn "ensure_kmscon: tty$n out of range — the kernel supports tty1..tty63 (MAX_NR_CONSOLES) — skipping."
+				return 1
+			}
 		# Normalize leading zeros (tty02 == tty2): the unit instance is the
 		# plain number, so tty02 would enable a phantom kmscon@tty02.service
 		# next to the real tty2 instance.
 		n=$((10#$n))
 		case " ${KMSCON_VTS[*]-} " in
-		*" $n "*) warn "ensure_kmscon: tty$n listed twice — skipping."
-			return 1 ;;
+		*" $n "*)
+			warn "ensure_kmscon: tty$n listed twice — skipping."
+			return 1
+			;;
 		esac
 		KMSCON_VTS+=("$n")
 	done
 	[ ${#KMSCON_VTS[@]} -gt 0 ] ||
-		{ warn "ensure_kmscon: empty tty list — skipping."
-			return 1; }
+		{
+			warn "ensure_kmscon: empty tty list — skipping."
+			return 1
+		}
 }
 
 ensure_kmscon() {
 	[ -n "${1:-}" ] ||
-		{ warn "ensure_kmscon: missing tty list — usage: ensure_kmscon tty2 (or tty1,tty2,...) — skipping."
-			return 1; }
+		{
+			warn "ensure_kmscon: missing tty list — usage: ensure_kmscon tty2 (or tty1,tty2,...) — skipping."
+			return 1
+		}
+	# WSL reports uname -s = Linux and (with WSLg) even has /dev/dri, but
+	# there is no VT login for kmscon to serve — skip before the checks that
+	# would pass on a systemd-enabled WSL2.
+	if is_wsl; then
+		warn "WSL detected — skipping kmscon setup (no VT login)."
+		return 0
+	fi
 	case "$(uname -s)" in
 	Linux) ;;
 	*)
