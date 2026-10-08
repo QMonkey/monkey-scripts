@@ -6,7 +6,9 @@
 #   id|check|desc|install|ver_regex|fallback|token
 #     id        binary (or sentinel) name; recorded in MISSING_* and used
 #               for package-name lookups
-#     check     bin (default) | ext | anyof:a b c | anyofext:a b c | ver:MIN
+#     check     bin (default) | ext | anyof:a b c | anyofext:a b c |
+#               ver:MIN | ver:MIN!bad bad (versions that pass MIN but are
+#               known broken, exact match on the extracted version)
 #     desc      printed text (default: id)
 #     install   pkg (default) | pkg:name,name | npm:x | go:x | cargo:x |
 #               pip:x | brew:x | rustup | rustup-component:x |
@@ -29,7 +31,12 @@ MISSING_RECOMMENDED=()
 MISSING_OPTIONAL=()
 
 parse_spec() {
-	IFS='|' read -r SPEC_ID SPEC_CHECK SPEC_DESC SPEC_INSTALL SPEC_VER_RE SPEC_FALLBACK SPEC_TOKEN SPEC_GROUP <<<"$1"
+	# Plain heredoc, NOT a herestring (`<<<"$1"`): legacy sh.vim — nvim/vim
+	# without tree-sitter for sh — parses `<<<` as a heredoc begin whose
+	# delimiter never matches, rendering the rest of the file as one unterminated heredoc.
+	IFS='|' read -r SPEC_ID SPEC_CHECK SPEC_DESC SPEC_INSTALL SPEC_VER_RE SPEC_FALLBACK SPEC_TOKEN SPEC_GROUP <<EOF
+$1
+EOF
 	SPEC_CHECK="${SPEC_CHECK:-bin}"
 	SPEC_DESC="${SPEC_DESC:-$SPEC_ID}"
 	SPEC_INSTALL="${SPEC_INSTALL:-pkg}"
@@ -118,7 +125,14 @@ record_missing() {
 }
 
 check_version_spec() {
-	local mode="$1" min="${SPEC_CHECK#ver:}" ver
+	local mode="$1" ver
+	# "ver:MIN" or "ver:MIN!bad bad" — the exclusion list names versions that
+	# satisfy the minimum but are KNOWN BROKEN (e.g. tmux 3.7–3.7b: exiting
+	# a session crashes instead of switching; fixed in 3.7c). Exact string
+	# match on the extracted version.
+	local vspec="${SPEC_CHECK#ver:}"
+	local min="${vspec%%!*}" bad=""
+	[ "$vspec" != "$min" ] && bad="${vspec#*!}"
 	if ! have_native_cmd "$SPEC_ID"; then
 		if [ -n "$SPEC_FALLBACK" ] && have_native_cmd "$SPEC_FALLBACK"; then
 			warn "${SPEC_DESC} binary not found, but ${SPEC_FALLBACK} is available"
@@ -139,6 +153,14 @@ check_version_spec() {
 		record_missing "$mode" "$SPEC_INSTALL_ID"
 		return 1
 	fi
+	local v
+	for v in $bad; do
+		if [ "$ver" = "$v" ]; then
+			fail "${SPEC_DESC} ${ver} (known broken — need >= ${min}, excluding: ${bad})"
+			record_missing "$mode" "$SPEC_INSTALL_ID"
+			return 1
+		fi
+	done
 	if version_ge "$ver" "$min"; then
 		ok "${SPEC_DESC} ${ver}"
 		if [ -n "$SPEC_TOKEN" ]; then
@@ -654,15 +676,34 @@ install_missing_required() {
 			have_native_cmd "$1" || ext_paths_ok "$1"
 		}
 		for rb in ${REQUIRED_REPROBE_LIST[@]+"${REQUIRED_REPROBE_LIST[@]}"}; do
-			label="$rb"
-			if [ -n "$name_fn" ]; then label=$("$name_fn" "$rb"); fi
-			if "$probe_fn" "$rb"; then
-				ok "$label installed"
-			else
-				MISSING_REQUIRED+=("$rb")
-				fail "$label still missing"
-				REQUIRED_FAILURES=$((REQUIRED_FAILURES + 1))
-			fi
+			case "$rb" in
+			@*) continue ;;
+			*\|*)
+				# A full spec entry: probe and label through the spec itself
+				# (anyof/anyofext/ext semantics included) — a project then
+				# keeps NO parallel name/availability tables beside
+				# REQUIRED_CHECKS: REQUIRED_REPROBE_LIST=("${REQUIRED_CHECKS[@]}").
+				parse_spec "$rb"
+				if probe_spec "$rb"; then
+					ok "$SPEC_DESC installed"
+				else
+					MISSING_REQUIRED+=("$SPEC_ID")
+					fail "$SPEC_DESC still missing"
+					REQUIRED_FAILURES=$((REQUIRED_FAILURES + 1))
+				fi
+				;;
+			*)
+				label="$rb"
+				if [ -n "$name_fn" ]; then label=$("$name_fn" "$rb"); fi
+				if "$probe_fn" "$rb"; then
+					ok "$label installed"
+				else
+					MISSING_REQUIRED+=("$rb")
+					fail "$label still missing"
+					REQUIRED_FAILURES=$((REQUIRED_FAILURES + 1))
+				fi
+				;;
+			esac
 		done
 		if [ ${#MISSING_REQUIRED[@]} -eq 0 ]; then
 			echo -e "${GREEN}All required tools now available.${NC}"
@@ -739,9 +780,41 @@ install_missing_optional() {
 		return 0
 	fi
 	echo -e "${YELLOW}${OPTIONAL_INSTALL_TITLE:-Installing optional tools}: ${missing[*]}...${NC}"
-	local bin spec ok
+	# Plain pkg strategies are batched into ONE transaction (mirrors
+	# install_missing_required); side-effecting strategies (npm/go/pip/
+	# brew/…) install per tool below.
+	local bin spec
+	local -a batched=()
 	for bin in "${missing[@]}"; do
 		spec=$(find_spec "$bin") || spec="$bin"
+		parse_spec "$spec"
+		[ "${SPEC_INSTALL:-pkg}" = "pkg" ] && batched+=("$bin")
+	done
+	if [ ${#batched[@]} -gt 0 ]; then
+		local -a names=()
+		for bin in "${batched[@]}"; do names+=("$(pkg_name "$bin")"); done
+		if install_pkg ${names[@]+"${names[@]}"}; then
+			for bin in "${batched[@]}"; do
+				spec=$(find_spec "$bin") || spec="$bin"
+				if probe_spec "$spec"; then
+					echo -e "  ${GREEN}✓ ${bin} installed${NC}"
+				else
+					echo -e "  ${RED}✗ failed to install ${bin}${NC}"
+					echo -e "    hint: $(get_install_hint "$bin")"
+				fi
+			done
+		else
+			for bin in "${batched[@]}"; do
+				echo -e "  ${RED}✗ failed to install ${bin}${NC}"
+				echo -e "    hint: $(get_install_hint "$bin")"
+			done
+		fi
+	fi
+	local ok
+	for bin in "${missing[@]}"; do
+		spec=$(find_spec "$bin") || spec="$bin"
+		parse_spec "$spec"
+		[ "${SPEC_INSTALL:-pkg}" = "pkg" ] && continue # batched above
 		echo -e "  ${YELLOW}→ installing ${bin}...${NC}"
 		ok=true
 		# A project may carry upstream's per-binary install table verbatim
