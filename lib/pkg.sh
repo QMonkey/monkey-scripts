@@ -120,12 +120,8 @@ pkg_name() {
 # current 0.7x). Projects append names here.
 BREW_FIRST=()
 
-# Homebrew's bin dirs. Appended to PATH (see install_linuxbrew), never
-# prepended.
-BREW_BIN_DIRS="/home/linuxbrew/.linuxbrew/bin /opt/homebrew/bin"
-
 # The brew-first whitelist: a BREW_FIRST tool installed via brew gets a
-# symlink in ~/.local/bin, which preseed_path seeds at the FRONT of PATH.
+# symlink in ~/.local/bin, which export_path seeds at the FRONT of PATH.
 # This is what keeps those tools beating the system versions now that brew
 # itself sits at the BACK. Idempotent; never replaces anything that is not a
 # symlink (a user's own script in ~/.local/bin stays untouched).
@@ -340,6 +336,21 @@ probe_brew_name() {
 	# nothing to probe against — don't filter.
 	have_native_cmd brew || return 0
 	brew info "$1" >/dev/null 2>&1
+}
+
+# The version the DISTRO REPO offers for a package (not the installed one):
+# normalized to X.Y, empty when no repo carries it. Natural sibling of
+# probe_pkg_name — answers "repo install or source build?" before spending
+# the build.
+repo_pkg_version() {
+	local ver=""
+	case "$OS" in
+	debian | ubuntu) ver=$(apt-cache policy "$1" 2>/dev/null | awk '/Candidate:/{print $2}') ;;
+	arch) ver=$(LC_ALL=C pacman -Si "$1" 2>/dev/null | awk '/^Version[[:space:]]*:/ {print $3; exit}') ;;
+	opensuse) ver=$(LC_ALL=C zypper --non-interactive info "$1" 2>/dev/null | awk -F': *' '/^Version/{print $2; exit}') ;;
+	centos | fedora) ver=$(dnf -q list available "$1" 2>/dev/null | awk 'NR>1 {print $2; exit}') ;;
+	esac
+	printf '%s' "$ver" | grep -oE '^[0-9]+\.[0-9]+' || true
 }
 
 # ──────────────────────────── AUR helper (arch) ────────────────────────────
@@ -570,10 +581,7 @@ install_pkg() {
 					# returns non-zero and _rc records it — same as an actual
 					# failed brew call.
 					if ((${#PKG_VALID[@]} > 0)); then
-						local fbrc=0
-						retry -t 1800 -s "brew install (fallback)" brew install ${PKG_VALID[@]+"${PKG_VALID[@]}"} || fbrc=$?
-						[ "$fbrc" -eq 124 ] && cleanup_timed_out_brew
-						[ "$fbrc" -eq 0 ]
+						brew_install_retry 1800 "brew install (fallback)" ${PKG_VALID[@]+"${PKG_VALID[@]}"}
 					else
 						false
 					fi
@@ -592,11 +600,10 @@ install_pkg() {
 			local brc=0
 			# The BREW_FIRST batch can carry heavy formulae (zig pulls
 			# llvm@22 + lld@22) — 7200 gives those downloads room.
-			retry -t 7200 -s "brew install" brew install ${PKG_VALID[@]+"${PKG_VALID[@]}"} || brc=$?
-			# A timed-out attempt leaves an orphaned ruby worker holding the
-			# cache flock — kill it BEFORE the system fallback, so the next
-			# attempt (or a later component) is not blocked for its timeout.
-			[ "$brc" -eq 124 ] && cleanup_timed_out_brew
+			brew_install_retry 7200 "brew install" ${PKG_VALID[@]+"${PKG_VALID[@]}"} || brc=$?
+			# A timed-out attempt's orphan cleanup ran inside the helper —
+			# BEFORE the system fallback below, so the next attempt (or a
+			# later component) is not blocked for its timeout.
 			[ "$brc" -eq 0 ] || install_sys_pkg ${PKG_VALID[@]+"${PKG_VALID[@]}"} || _rc=1
 			# Link on the BREW BATCH's own outcome — NOT on _rc, which also
 			# carries unrelated names' failures from the system batch
@@ -624,6 +631,20 @@ install_pkg() {
 	# install status.
 	hash -r
 	return "$_rc"
+}
+
+# One brew install with the standard retry and orphan cleanup: a timed-out
+# attempt (rc 124) leaves an orphaned ruby worker holding the cache download
+# flock — every later brew call would die with "already locked" — so the
+# cleanup runs BEFORE the caller's retry ladder can hit the same lock again.
+# Returns the install's exit code.
+brew_install_retry() {
+	local t="$1" desc="$2"
+	shift 2
+	local brc=0
+	retry -t "$t" -s "$desc" brew install "$@" || brc=$?
+	[ "$brc" -eq 124 ] && cleanup_timed_out_brew
+	return "$brc"
 }
 
 # A package present in every repo set of its distro — the probe canary for
@@ -736,7 +757,7 @@ install_build_deps() {
 	names=("${unique[@]}")
 	((${#names[@]} > 0)) || return 0
 	if [ "$OS" = macos ]; then
-		retry -t 1800 -s "brew install build deps" brew install ${names[@]+"${names[@]}"}
+		brew_install_retry 1800 "brew install build deps" ${names[@]+"${names[@]}"}
 	else
 		install_sys_pkg ${names[@]+"${names[@]}"}
 	fi
@@ -755,6 +776,27 @@ ensure_git() {
 	have_native_cmd git || fail "git installation failed — install it manually: $(get_install_hint git)."
 }
 
+# Shared rustup installer core (ensure_rustup's and ensure_rust's mechanics):
+# download the official installer FULLY before executing with retries —
+# `curl | sh` would run a truncated script if the connection drops mid-stream
+# — then the -y toolchain install (hundreds of MB, long timeout, retried:
+# rustup-init is idempotent so a retry continues instead of starting over),
+# then source ~/.cargo/env for this process. Returns 1 on failure; callers
+# add their own messaging (fatal vs warn-and-continue).
+_install_rustup_core() {
+	local rustup_init="/tmp/rustup_init.$$.sh"
+	if ! retry -t 1800 -s "rustup installer download" curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o "$rustup_init"; then
+		rm -f "$rustup_init"
+		return 1
+	fi
+	retry -t 3600 -s "rustup toolchain install" sh "$rustup_init" -y || {
+		rm -f "$rustup_init"
+		return 1
+	}
+	rm -f "$rustup_init"
+	# ~/.cargo/bin (or $CARGO_HOME/bin) now exists — seed it for this process.
+}
+
 # Rust toolchain via the official rustup installer, for projects that build
 # Rust from source (wezterm). Idempotent: an existing cargo short-circuits.
 ensure_rustup() {
@@ -762,24 +804,9 @@ ensure_rustup() {
 		ok "rust toolchain already installed."
 		return 0
 	fi
-	# Official rustup installer (Rust 1.71+ required by some builds).
-	# Downloaded fully before executing, with retries — `curl | sh` would run
-	# a truncated script if the connection drops mid-stream.
 	info "Installing rustup (non-interactive)..."
-	local rustup_init="/tmp/rustup_init.$$.sh"
-	if retry -t 1800 -s "rustup installer download" curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o "$rustup_init"; then
-		# The -y run downloads the whole toolchain (hundreds of MB) — long
-		# timeout, retried: rustup-init is idempotent, a retry continues.
-		retry -t 3600 -s "rustup toolchain install" sh "$rustup_init" -y
-		rm -f "$rustup_init"
-	else
-		fail "rustup installer download failed — install it manually: https://rust-lang.org/tools/install/"
-	fi
-	# rustup installs into ~/.cargo — put cargo on PATH for this run (the
-	# cargo build below runs in this same script). Not `[ ... ] && . ...`:
-	# a missing file would make the function return non-zero and, under
-	# set -e, silently abort the whole script.
-	if [ -f "$HOME/.cargo/env" ]; then . "$HOME/.cargo/env"; fi
+	_install_rustup_core ||
+		fail "rustup installation failed — install it manually: https://rust-lang.org/tools/install/"
 	have_native_cmd cargo || fail "rustup installation failed — install it manually: https://rust-lang.org/tools/install/"
 	ok "rustup installed."
 }
@@ -843,7 +870,7 @@ ensure_pip() {
 ensure_system_bin() {
 	local bin="$1" desc="${2:-$1}" ver
 	if have_native_cmd "$bin"; then
-		ver=$("$bin" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1)
+		ver=$(extract_version "$bin")
 		ok "${desc} ${ver:+$ver }already installed."
 		return 0
 	fi
@@ -961,27 +988,16 @@ install_linuxbrew() {
 		# system's wholesale: brew's python@3.x hid /usr/bin/python3 and vim
 		# linked against it. Plain-appending put brew BEHIND the /mnt/*
 		# interop section, so a plain `npm` resolved to the Windows shim and
-		# `npm i -g` installed into the Windows tree. path_add_pre_win
+		# `npm i -g` installed into the Windows tree. export_path_pre_win
 		# splits the difference: system > brew > Windows shims; tools that
 		# must beat the system version are whitelisted via _brew_first_link.
-		path_add_pre_win "$brew_prefix/bin"
-		path_add_pre_win "$brew_prefix/sbin"
+		export_path_pre_win "$brew_prefix/bin" "$brew_prefix/sbin"
 		ok "Homebrew/Linuxbrew ready at $brew_prefix (before Windows shims, after system paths)."
 		# Persist the same insert for future shells (POSIX expansions only:
 		# the login profile may be zsh, which does not word-split unquoted
-		# $PATH — hence no loops over it). Idempotent — append_env_block
-		# skips if the marker is already present.
-		local line
-		line='case $PATH in
-*":'"$brew_prefix"'/bin:"*) ;;
-*:/mnt/*)
-	pre=${PATH%%:/mnt/*}
-	PATH="$pre:'"$brew_prefix"'/bin:'"$brew_prefix"'/sbin:${PATH#"$pre":}"
-	unset pre ;;
-/mnt/*) PATH="'"$brew_prefix"'/bin:'"$brew_prefix"'/sbin:$PATH" ;;
-*) PATH="$PATH:'"$brew_prefix"'/bin:'"$brew_prefix"'/sbin" ;;
-esac'
-		append_env_block "Homebrew PATH (before Windows shims)" "$line"
+		# $PATH). Idempotent — append_env_block skips if the marker is
+		# already present.
+		persist_brew_path "$brew_prefix"
 	else
 		# Two flavors of "no usable brew": never installed, or installed but
 		# dead (bin/brew present, vendor ruby missing). Name the difference so
