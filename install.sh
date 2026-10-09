@@ -113,7 +113,7 @@ install_main() {
 	install_step_tool
 	install_step_post_tool
 
-	clone_monkey_project
+	clone_project
 	echo ""
 
 	if [ "$CHECKHEALTH_POS" != "after_links" ] && [ "${CHECKHEALTH_MODE:-run}" != "none" ]; then
