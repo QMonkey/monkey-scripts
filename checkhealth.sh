@@ -35,6 +35,7 @@ fi
 . "$_MONKEY_LIB_DIR/lib/sudo.sh"
 . "$_MONKEY_LIB_DIR/lib/pkg.sh"
 . "$_MONKEY_LIB_DIR/lib/config.sh"
+. "$_MONKEY_LIB_DIR/lib/env.sh"
 . "$_MONKEY_LIB_DIR/lib/checks.sh"
 . "$_MONKEY_LIB_DIR/lib/optional.sh"
 
@@ -156,6 +157,11 @@ checkhealth_main() {
 	parse_args "$@"
 	require_home
 	OS=$(os_detect)
+	# Seed the framework bin dirs for THIS process: a standalone --install
+	# run creates dirs (cargo, npm-global, GOPATH) whose binaries must
+	# resolve in-session; install.sh's chain preseeds its own process the
+	# same way.
+	export_path
 
 	print_header
 	print_header_extra
