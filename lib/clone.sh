@@ -1,11 +1,12 @@
 # shellcheck shell=bash
-# monkey-scripts/lib/clone.sh — clone / checkhealth / autostart / finish.
+# monkey-scripts/lib/clone.sh — clone / checkhealth / finish.
 #
 # Sourced by scripts/install.sh (not by checkhealth.sh).
 #
 # Data contract (project side):
 #   PROJECT / PROJECT_REPO / INSTALL_DIR
-#   AUTOSTART_FILES    accumulated by write_tty_autostart (summary line)
+#   AUTOSTART_FILES    accumulated by write_tty_autostart (lib/env.sh;
+#                      summary line)
 #   SUMMARY_LINES      completion text, one echo -e per entry; an entry
 #                      starting with "?VAR|" prints only when $VAR is set
 #   FINISH_INJECT      1 (default) → print/perform the TIOCSTI injection hint
@@ -108,24 +109,7 @@ clone_repo() {
 	return 1
 }
 
-# Insert one or more lines into SUMMARY_LINES so that the FIRST inserted
-# line lands at <index> (later ones follow in order). <index> may be
-# negative — counted from the end (-1 = before the last line), which is how
-# variable outcomes ("kmscon:" console line, RDP lines) slot ahead of the
-# fixed "Update:" tail; small positive indexes slot into the fixed head
-# (the compositor "Autostart:" line lands at 2, after Config/Start).
-# Lines pass through finish_install verbatim: a leading "?VAR|" makes an
-# entry conditional (see the data contract above).
-summary_insert_at() {
-	local idx=$1
-	shift
-	local len=${#SUMMARY_LINES[@]}
-	[ "$idx" -lt 0 ] && idx=$((len + idx))
-	local -a head=("${SUMMARY_LINES[@]:0:idx}") tail=("${SUMMARY_LINES[@]:idx}")
-	SUMMARY_LINES=(${head[@]+"${head[@]}"} "$@" ${tail[@]+"${tail[@]}"})
-}
-
-clone_monkey_project() {
+clone_project() {
 	# git must exist before anything here runs: the pull and the clone both
 	# need it. ensure_git installs it via the package manager when missing
 	# (setup_sudo has already run by the time this step is reached).
@@ -167,83 +151,21 @@ verify_checkhealth() {
 	bash "$INSTALL_DIR/checkhealth.sh" --skip-check-config || true
 }
 
-# ────────────────── compositor autostart (guarded VT login) ──────────────────
-# The guarded autostart block. POSIX sh: it lands in ~/.profile too, which
-# display managers may source with a minimal shell. Guards, cheapest first,
-# so shells inside a desktop terminal or tmux pane short-circuit with zero
-# forks:
-#   1. $WAYLAND_DISPLAY / $DISPLAY both unset — one of them is set in any
-#      desktop session (Wayland or X11).
-#   2. stdin is a real VT (/dev/ttyN) — excludes ssh (/dev/pts/N), tmux
-#      panes and desktop terminals in one check. Immune to inherited env: a
-#      TTY-started tmux server passes XDG_VTNR down to its panes, but their
-#      stdin stays a pty.
-#   3. no <proc> running — single-instance policy: once the compositor owns a
-#      session, VT logins on other consoles fall through to a plain shell (the
-#      escape hatch instead of a second compositor).
-#   4. kmscon session (TERM=kmscon — the kmscon >= 10.0.0 default, terminfo
-#      shipped alongside) → wrap the compositor in kmscon-launch-gui: the
-#      wrapper backgrounds the kmscon terminal (private OSC escape), lets the
-#      compositor take DRM master on the same VT, and restores kmscon after.
-#      Without the wrapper installed, skip the GUI start instead of bare-
-#      execing the compositor underneath a live kmscon renderer. The TERM
-#      check is deliberately the ONLY detection: sessions that do not set
-#      TERM=kmscon are pre-10.0.0 or user-overridden builds, and those lack
-#      the OSC background/foreground handoff the wrapper depends on — for
-#      them the plain exec is as good as it gets.
-autostart_block() {
-	local exec_cmd="$1" pgrep_name="$2"
-	cat <<EOF
-# $PROJECT autostart (remove these lines to disable)
-# Keep the block below ABOVE any "exec tmux" auto-start block: on a bare TTY
-# exec replaces the login shell with the compositor, so the tmux
-# auto-start line is never reached and the desktop never runs inside a
-# tmux pane. Inside a desktop terminal the env guards short-circuit and
-# the tmux auto-start runs normally.
-if [ -z "\${WAYLAND_DISPLAY:-}" ] && [ -z "\${DISPLAY:-}" ]; then
-    case "\$(tty 2>/dev/null)" in
-    /dev/tty[0-9]*)
-        if pgrep -x $pgrep_name >/dev/null 2>&1; then
-            : # single instance: the compositor already owns a session
-        elif [ "\${TERM:-}" = kmscon ]; then
-            if command -v kmscon-launch-gui >/dev/null 2>&1; then
-                exec kmscon-launch-gui $exec_cmd
-            else
-                echo "kmscon session: kmscon-launch-gui not found — start $exec_cmd manually." >&2
-            fi
-        else
-            exec $exec_cmd
-        fi
-        ;;
-    esac
-fi
-EOF
-}
-
-write_tty_autostart() {
-	local exec_cmd="$1" pgrep_name="$2"
-	local marker="# $PROJECT autostart" f
-	# WSL has no VT login — stdin never resolves to /dev/ttyN, so the guarded
-	# block would be dead code. WSLg renders single GUI apps without a
-	# compositor.
-	if is_wsl; then
-		info "WSL detected — skipping autostart setup (no VT login; WSLg covers GUI apps)."
-		return 0
-	fi
-	while IFS= read -r f; do
-		[ -n "$f" ] || continue
-		[ -f "$f" ] || touch "$f"
-		if grep -qF -- "$marker" "$f"; then
-			ok "autostart block already present in $f."
-		else
-			# Ordering vs a tmux auto-start block needs no insert logic: the
-			# meta-installer installs compositor repos before the tmux repo,
-			# so this block is always appended first.
-			printf '\n%s\n' "$(autostart_block "$exec_cmd" "$pgrep_name")" >>"$f"
-			ok "Added autostart block to $f."
-		fi
-		AUTOSTART_FILES="$AUTOSTART_FILES $f"
-	done < <(shell_env_files)
+# Insert one or more lines into SUMMARY_LINES so that the FIRST inserted
+# line lands at <index> (later ones follow in order). <index> may be
+# negative — counted from the end (-1 = before the last line), which is how
+# variable outcomes ("kmscon:" console line, RDP lines) slot ahead of the
+# fixed "Update:" tail; small positive indexes slot into the fixed head
+# (the compositor "Autostart:" line lands at 2, after Config/Start).
+# Lines pass through finish_install verbatim: a leading "?VAR|" makes an
+# entry conditional (see the data contract above).
+summary_insert_at() {
+	local idx=$1
+	shift
+	local len=${#SUMMARY_LINES[@]}
+	[ "$idx" -lt 0 ] && idx=$((len + idx))
+	local -a head=("${SUMMARY_LINES[@]:0:idx}") tail=("${SUMMARY_LINES[@]:idx}")
+	SUMMARY_LINES=(${head[@]+"${head[@]}"} "$@" ${tail[@]+"${tail[@]}"})
 }
 
 # ────────────────── completion ──────────────────
