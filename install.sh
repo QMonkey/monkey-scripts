@@ -34,6 +34,7 @@ fi
 . "$_MONKEY_LIB_DIR/lib/sudo.sh"
 . "$_MONKEY_LIB_DIR/lib/pkg.sh"
 . "$_MONKEY_LIB_DIR/lib/config.sh"
+. "$_MONKEY_LIB_DIR/lib/env.sh"
 . "$_MONKEY_LIB_DIR/lib/clone.sh"
 . "$_MONKEY_LIB_DIR/lib/kmscon.sh"
 
@@ -103,6 +104,11 @@ install_main() {
 	# opens its prepare hook with `echo ""`).
 	setup_sudo
 
+	# Seed the framework bin dirs BEFORE anything runs: with no [ -d ]
+	# filter the entries are seeded even when the dirs do not exist yet, so
+	# binaries installed by any later step resolve immediately.
+	export_path
+
 	install_step_prepare
 	install_step_tool
 	install_step_post_tool
@@ -115,7 +121,6 @@ install_main() {
 		echo ""
 	fi
 
-	refresh_path
 	install_step_autostart
 
 	if [ "$PERSIST_PATH" = 1 ] && [ "${PERSIST_POS:-after_links}" = "before_links" ]; then
