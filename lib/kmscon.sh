@@ -18,6 +18,35 @@ KMSCON_UNIT_PATH=/etc/systemd/system/kmscon@.service
 KMSCON_PAM_PATH=/etc/pam.d/kmscon
 KMSCON_UNIT_MARKER="managed by monkey-scripts (kmscon setup) v1"
 
+# Default argument pre-parser for installers offering --with-kmscon
+# [tty[,tty...]] (default tty2): consumes the flag BEFORE install_main sees
+# the args (it fills _INSTALL_ARGS; the caller runs `parse_install_args "$@"`
+# then `install_main "${_INSTALL_ARGS[@]}"`). Sets KMSCON_TTYS ("" = flag not
+# given) and KMSCON_DONE. Projects with extra flags override this and
+# delegate the leftover args themselves.
+parse_install_args() {
+	KMSCON_TTYS=""
+	KMSCON_DONE=""
+	local args=()
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--with-kmscon)
+			KMSCON_TTYS=tty2
+			if [ $# -gt 1 ]; then
+				case "$2" in
+				--*) ;; # next flag: keep the tty2 default
+				*) KMSCON_TTYS=$2
+					shift ;;
+				esac
+			fi
+			;;
+		*) args+=("$1") ;;
+		esac
+		shift
+	done
+	_INSTALL_ARGS=("${args[@]+"${args[@]}"}")
+}
+
 # Parse "<tty[,tty...]>" or "<N,N>" into KMSCON_VTS (VT numbers). Returns 1
 # on any malformed token (caller bug): the caller-listed set IS the
 # replacement set, so a typo must not silently widen or narrow it — the
@@ -59,6 +88,19 @@ _kmscon_parse_ttys() {
 			warn "ensure_kmscon: empty tty list — skipping."
 			return 1
 		}
+}
+
+# The --with-kmscon step inside a compositor's install_step_autostart: run
+# the takeover when the flag was given (parse_install_args filled
+# KMSCON_TTYS) and record success in KMSCON_DONE for the summary. The WSL /
+# non-Linux / no-KMS guards live in ensure_kmscon itself (skip = success).
+run_kmscon_setup() {
+	[ -n "$KMSCON_TTYS" ] || return 0
+	if ensure_kmscon "$KMSCON_TTYS"; then
+		KMSCON_DONE=1
+	else
+		warn "kmscon setup failed — continuing without it."
+	fi
 }
 
 ensure_kmscon() {
