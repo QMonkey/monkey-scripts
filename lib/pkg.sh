@@ -6,7 +6,9 @@
 #   ── system package managers ──  pkg_name mapping table, batch filtering,
 #       index refresh, pacman lock cleanup, index probing, the install path
 #       (install_sys_pkg / install_pkg — the Homebrew-fallback orchestrator),
-#       build deps, the AUR helper
+#       install_strategy_step (one install step, dispatcher over every
+#       installer here), build deps,
+#       the AUR helper
 #   ── Homebrew ──                 BREW_FIRST, probing, install_linuxbrew
 #   ── rust / cargo ──             ensure_rust (rustup)
 #   ── go ──                       go_install
@@ -445,6 +447,77 @@ install_pkg() {
 	return "$_rc"
 }
 
+# ──────────────────────── install strategies ────────────────────────
+# Runs one install step: <kind> picks the installer (pkg | npm | go | cargo
+# | pip | brew | rustup | rustup-component | python-unversioned | none) and
+# <args> is its package argument. Returns non-zero when the step failed.
+# The integration point over every package manager's installer in this
+# file — callers hand in a step, not a manager choice.
+install_strategy_step() {
+	local kind="$1" args="$2"
+	case "$kind" in
+	pkg)
+		if [ -n "$args" ]; then
+			# args are binaries, not package names: the distro package is
+			# whatever pkg_name maps them to (cc → gcc, then clang).
+			local -a names=() b
+			for b in $args; do
+				names+=("$(pkg_name "$b")")
+			done
+			install_pkg "${names[@]}"
+		else
+			install_pkg "$(pkg_name "$SPEC_ID")"
+		fi
+		;;
+	npm)
+		ensure_npm || return 1
+		npm_install_g $args
+		;;
+	go)
+		go_install $args
+		;;
+	cargo)
+		ensure_rust || return 1
+		retry -t 1800 -s "cargo install $args" cargo install $args
+		;;
+	pip)
+		# ensure_pip first: the fallback dies with command-not-found when
+		# pip3 is missing (Leap 16). stderr stays visible — a silently
+		# swallowed pip error is what made the Leap 16 pylsp failure
+		# undiagnosable.
+		ensure_pip || return 1
+		retry -t 1800 -s "pip3 install $args" sudo_cmd pip3 install $args ||
+			retry -t 1800 -s "pip3 install $args" pip3 install $args
+		;;
+	brew)
+		have_native_cmd brew || return 1
+		# zig/zls pull LLVM and marksman pulls the .NET runtime as formula
+		# dependencies — installs that dwarf a normal bottle.
+		local bt=1800
+		case "$args" in
+		zig | zls | marksman) bt=7200 ;;
+		esac
+		brew_install_retry "$bt" "brew install $args" $args
+		;;
+	rustup)
+		ensure_rust
+		;;
+	rustup-component)
+		ensure_rust || return 1
+		retry -t 1800 -s "rustup component add $args" rustup component add $args
+		;;
+	python-unversioned)
+		install_python_for_gtags
+		;;
+	none)
+		return 1
+		;;
+	*)
+		install_pkg "$kind${args:+:$args}"
+		;;
+	esac
+}
+
 # ────────────────── source-build dependency groups ──────────────────
 # Projects that build from source (tmux, neovim, ...) name LOGICAL GROUPS
 # here; this table owns the per-distro names — same dispatch style as
@@ -556,24 +629,6 @@ ensure_git() {
 		install_pkg git || :
 	fi
 	have_native_cmd git || fail "git installation failed — install it manually: $(get_install_hint git)."
-}
-
-# Install a binary from the system package manager if it is missing.
-# Usage: ensure_system_bin <bin> <desc> — never fatal (the package may not be
-# in the repos; checkhealth reports what is left afterwards).
-ensure_system_bin() {
-	local bin="$1" desc="${2:-$1}" ver
-	if have_native_cmd "$bin"; then
-		ver=$(extract_version "$bin")
-		ok "${desc} ${ver:+$ver }already installed."
-		return 0
-	fi
-	info "Installing ${desc} via the system package manager..."
-	if install_pkg "$(pkg_name "$bin")"; then
-		ok "${desc} installed."
-	else
-		warn "${desc} install failed — install it manually: $(get_install_hint "$(pkg_name "$bin")")"
-	fi
 }
 
 # ──────────────────────────── AUR helper (arch) ────────────────────────────
