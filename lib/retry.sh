@@ -95,7 +95,7 @@ _retry_run() {
 # cmd's own flags are untouched — getopts stops at the first non-option
 # word, so only the leading -n/-d/-m/-t/-s/-H belong to retry.
 retry() {
-	local attempts=5 base=15 max=120 timeout_s=600 desc="" timeout_hook=""
+	local attempts=5 base=15 max=120 timeout_s=600 desc="" hook=""
 	local opt
 	# A leading -- may guard a wrapped command that itself starts with an
 	# option-looking word; strip it BEFORE parsing.
@@ -110,7 +110,7 @@ retry() {
 		m) max=$OPTARG ;;
 		t) timeout_s=$OPTARG ;;
 		s) desc=$OPTARG ;;
-		H) timeout_hook=$OPTARG ;;
+		H) hook=$OPTARG ;;
 		*) return 2 ;;
 		esac
 	done
@@ -127,8 +127,8 @@ retry() {
 		else
 			rc=$?
 		fi
-		if [ -n "$timeout_hook" ] && [ "$(type -t "$timeout_hook")" = function ]; then
-			"$timeout_hook" "$rc"
+		if [ -n "$hook" ] && [ "$(type -t "$hook")" = function ]; then
+			"$hook" "$rc"
 		fi
 		return "$rc"
 	fi
@@ -141,8 +141,8 @@ retry() {
 			rc=$?
 		fi
 		# Attempt hook (see -H): every attempt, success included.
-		if [ -n "$timeout_hook" ] && [ "$(type -t "$timeout_hook")" = function ]; then
-			"$timeout_hook" "$rc"
+		if [ -n "$hook" ] && [ "$(type -t "$hook")" = function ]; then
+			"$hook" "$rc"
 		fi
 		if [ "$rc" -eq 0 ]; then
 			RETRY_ACTIVE_COUNT=$((RETRY_ACTIVE_COUNT - 1))
