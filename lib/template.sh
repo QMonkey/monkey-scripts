@@ -7,20 +7,16 @@
 # contract: warn + non-zero, never aborts the caller.
 
 # render <template> <outfile> — the substitution renderer: gomplate (Go
-# text/template) over the template's {{ .Env.NAME }} references, values from
-# the caller-exported environment. Structure (model catalogs, channel members,
-# optional blocks) lives IN the template as {{ range }}/{{ if }}: the shell no
-# longer hand-concatenates JSON/YAML fragments, which is where stray commas, a
-# literal \n and last-one-wins duplicate keys came from.
-# A reference to an unset variable is a hard gomplate error (non-zero exit),
-# so the "unset placeholder must fail loudly" contract needs no separate
-# inventory pass — an unset reference aborts instead of silently rendering
-# empty (an observed crash loop). Runtime indirections ($VAR / ${VAR}
-# credential-NAME references the agent resolves itself) survive untouched,
-# because {{ }} is the only syntax gomplate reads — no SHELL-FORMAT whitelist
-# and no __NAME__ alias exports are needed any more. Atomic 0600 write;
-# failure contract: warn + non-zero, never aborts the caller.
-# The fill mode lives in render_fill below.
+# text/template) over the template's {{ .Env.NAME }} references, values from the
+# caller-exported environment. Structure (model catalogs, channel members,
+# optional keys) lives IN the template as {{ range }}/{{ if }}: shell-built
+# fragments are what used to produce stray commas, literal \n and last-one-wins
+# duplicate keys in rendered configs.
+# A reference to an unset variable is a hard gomplate error, so "unset must
+# fail loudly" needs no inventory pass — and no whitelist either: {{ }} never
+# touches the $VAR / ${VAR} credential-NAME references the agent resolves at
+# runtime. Atomic 0600 write; failure contract: warn + non-zero, never aborts
+# the caller. The fill mode lives in render_fill below.
 render() {
 	local template="$1" outfile="$2" tmp err rc=0 missing
 	if [ ! -f "$template" ]; then
