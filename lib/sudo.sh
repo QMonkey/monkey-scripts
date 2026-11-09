@@ -56,10 +56,9 @@ cleanup_sudo() {
 # implementations.
 #
 # No sudo keepalive: with the drop-in in place the timestamp is never read,
-# so there is nothing to keep alive. The old background refresh loop also
-# leaked a process per run and never worked inside WSL/containers where no
-# helper can re-authenticate for us. The failure mode of a missing drop-in
-# is covered by sudo_cmd's lazy re-auth below — do not reintroduce it.
+# so there is nothing to keep alive — and no helper could re-authenticate for
+# us inside WSL/containers anyway. The failure mode of a missing drop-in is
+# covered by sudo_cmd's lazy re-auth below — do not reintroduce it.
 setup_sudo() {
 	SUDO_BIN=$(native_sudo) || return 0
 	if [ "$(id -u)" -eq 0 ]; then
