@@ -1,8 +1,8 @@
 # shellcheck shell=bash
 # monkey-scripts/lib/env.sh — PATH seeding / persistence, shell env-file
 # infrastructure, compositor autostart. Sourced by scripts/install.sh and
-# scripts/checkhealth.sh (BEFORE clone.sh and checks.sh, which rely on
-# export_path mid-run).
+# scripts/checkhealth.sh (each entry point calls export_path for its own
+# process right after os_init).
 #
 #   bin_dirs / export_path / persist_path — the framework bin-dir set: one
 #       source of truth emitting idempotent PATH-update lines
@@ -28,12 +28,12 @@
 # brew_ensure ran. The OS candidates follow: a mac never has /home/linuxbrew
 # and a Linux host never has /opt/homebrew, so a union list only ever put the
 # OTHER system's prefix on PATH. /usr/local is a candidate on both: the
-# Intel-mac prefix and the legacy Linuxbrew one. Reads the framework's $OS
-# (set by install_main / checkhealth before any of this runs); unset or
-# unknown takes the Linux arm.
+# Intel-mac prefix and the legacy Linuxbrew one. Reads the framework's $OS,
+# which os_init has already validated (and exported) by the time any of this
+# runs, so there is no unset/unknown arm left to take.
 brew_prefixes() {
 	local discovered cand list="/opt/homebrew /usr/local"
-	[ "${OS:-unknown}" = macos ] || list="/home/linuxbrew/.linuxbrew /usr/local"
+	[ "$OS" = macos ] || list="/home/linuxbrew/.linuxbrew /usr/local"
 	# A shell function or alias named brew would answer "brew", not a path —
 	# require the resolved binary before turning it into a prefix.
 	if discovered=$(command -v brew) && [ -x "$discovered" ]; then
@@ -156,7 +156,7 @@ append_env_block() {
 # /run/user/$UID 0700). Sessionless shells — WSL2 (it registers a logind
 # session only for the distro's DEFAULT user, falling back to root without
 # a /etc/wsl.conf [user] default), containers, CI, `su` — have none, and
-# tools that write runtime files there fail (nvim/vim serverstart,
+# tools that write runtime files there fail (nvim serverstart(),
 # fzf-lua, ...). Keyed on the SYMPTOM, not is_wsl(); the real fix is a
 # proper default user (see consuming repos' README, "Precautions" → WSL2).
 # runtime_dir_path resolves the dir for the REAL current user: under
@@ -167,11 +167,11 @@ runtime_dir_path() {
 	local uid
 	uid=$(id -u)
 	case "$XDG_RUNTIME_DIR" in
-	"" | "/run/user/$uid") echo "${XDG_RUNTIME_DIR:-/run/user/$uid}" ;;
+	"" | "/run/user/$uid") printf '%s\n' "${XDG_RUNTIME_DIR:-/run/user/$uid}" ;;
 	# Another user's /run/user/N: unownable for this uid — ignore it.
-	/run/user/*) echo "/run/user/$uid" ;;
+	/run/user/*) printf '%s\n' "/run/user/$uid" ;;
 	# A deliberate custom path (containers, custom setups): respect it.
-	*) echo "$XDG_RUNTIME_DIR" ;;
+	*) printf '%s\n' "$XDG_RUNTIME_DIR" ;;
 	esac
 }
 
@@ -257,7 +257,7 @@ ensure_xdg_runtime_dir() {
 	fi
 
 	# Both tiers failed (no logind/seatd) — spell out both fixes.
-	warn "Could not create $dir — nvim/vim serverstart() will keep failing (fzf-lua and other RPC users)."
+	warn "Could not create $dir — nvim serverstart() will keep failing (fzf-lua and other RPC users)."
 	warn "  Manual fix:  sudo touch $marker && sudo systemctl start user-runtime-dir@$uid.service"
 }
 
@@ -265,8 +265,8 @@ ensure_xdg_runtime_dir() {
 # the current value is unusable for this uid; empty string when fine.
 # ensure_xdg_runtime_dir repairs SYSTEM state, but a child can never change
 # the parent shell's env — the stale /run/user/0 a WSL root-boot session
-# inherited survives it (observed: repair logged "ready", yet the same
-# shell's `systemctl --user` still failed, skipping service registration).
+# inherited survives it (the repair can log "ready" while the same shell's
+# `systemctl --user` still fails, skipping service registration).
 # Only the parent shell can export the fix; finish_install delivers it
 # via TIOCSTI. Guard is state-based, not WSL-based: normal logins and `su`
 # already carry pam_systemd's correct value → idempotent no-op.
@@ -317,7 +317,7 @@ if [ -z "\${WAYLAND_DISPLAY:-}" ] && [ -z "\${DISPLAY:-}" ]; then
             if command -v kmscon-launch-gui >/dev/null 2>&1; then
                 exec kmscon-launch-gui $exec_cmd
             else
-                echo "kmscon session: kmscon-launch-gui not found — start $exec_cmd manually." >&2
+                printf '%s\n' "kmscon session: kmscon-launch-gui not found — start $exec_cmd manually." >&2
             fi
         else
             exec $exec_cmd
@@ -396,9 +396,7 @@ bin_dirs() {
 # FIRST, then the framework bin dirs. One list, one block, so the priority is
 # fixed by construction instead of by which writer touched the profile last
 # (prepend lines execute top-to-bottom, so the tier rendered last is the tier
-# that ends up ahead — two blocks only agreed with the live PATH as long as
-# brew happened to be persisted before the toolchain block; a
-# PERSIST_POS=before_links run whose brew came later flipped it).
+# that ends up ahead).
 # The brew tier still goes through _brew_path_snippet, which is where the
 # host decides HOW brew is placed, not whether it comes first:
 #   macOS — a prepend like every other dir, so running it first is what
@@ -430,7 +428,7 @@ persist_path() {
 	# the case guards re-check at shell startup. brew_ensure calls this too
 	# (not through install.sh's persist_path_step gate), so a host that
 	# bootstraps Homebrew gets its PATH persisted even with PERSIST_PATH=0 —
-	# the carve-out Homebrew always had, now for the whole block.
+	# Homebrew's carve-out, applied to the whole block.
 	# No summary line of its own: append_env_block reports each file it
 	# actually wrote, and this runs twice in a brew-carrying install
 	# (brew_ensure, then the gate) — a "persistence added" on the second,
@@ -449,7 +447,7 @@ persist_path() {
 #     NOT outrank system paths; positional insert, ahead of the WSL shims only.
 # Callers name dirs high → low (bin sbin); both arms honour that order.
 _brew_path_snippet() {
-	if [ "${OS:-unknown}" = macos ]; then
+	if [ "$OS" = macos ]; then
 		_path_prepend_snippet "$@"
 		return 0
 	fi
