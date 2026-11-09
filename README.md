@@ -370,8 +370,10 @@ past this gate: a run that bootstraps Homebrew persists its PATH even with
 priority inside the profile cannot depend on which step ran last. Its marker
 line is `# [head] bin dirs + Homebrew PATH (framework installer)`; the
 compositor autostart block is the `tail` class, marked
-`$PROJECT autostart (remove these lines to disable)` — the class annotation and
-the dedup on the bare marker text are both `append_env_block`'s (`lib/env.sh`).
+`$PROJECT autostart (remove these lines to disable)` — the class annotation, the
+dedup on the bare marker text and the rewrite that keeps the file partitioned
+(head → normal → tail, one blank line between blocks, none at EOF) are all
+`append_env_block`'s (`lib/env.sh`).
 
 Unlike `checkhealth.sh`, `fail()` aborts the installer at the first fatal
 step (`MONKEY_FAIL_EXITS=true`).
