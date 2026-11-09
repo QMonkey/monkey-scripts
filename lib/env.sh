@@ -87,20 +87,66 @@ shell_env_files() {
 # (write_tty_autostart does) — any later call overwrites it.
 ENV_BLOCK_FILES=""
 
+# env_source_line <path> — the ONE rendering of a profile line that sources an
+# env file: `[[ -f X ]] && { set -a; source X; set +a; }`.
+#
+# X is spelled ~-relative while the file sits under $HOME, which is the default
+# for every ${XDG_CONFIG_HOME:-$HOME/.config}-derived path, and absolute
+# otherwise so an override never ends up naming a different file. `~` is the
+# form a profile normally reads as, and it survives a $HOME containing spaces;
+# with HOME unset bash still resolves ~ through the passwd entry where "$HOME"
+# would expand to nothing and the guard would silently no-op. Measured in both
+# shells: ~ still expands when $HOME itself contains spaces, so the ~-form needs
+# no quoting; the absolute form is quoted because a path outside $HOME may.
+#
+# PATH lines are the opposite case and keep a literal $HOME (see bin_dirs):
+# a ~ inside double quotes or a case pattern does NOT expand, so `PATH="~/.x"`
+# would put the two characters ~ into PATH and the idempotency guard would
+# never match the expanded value PATH actually holds.
+env_source_line() {
+	# Declaring and deriving in one `local` would leave _shown empty: bash
+	# expands every word of a local command before assigning any of them.
+	local _p="$1"
+	local _shown
+	# Readable ~ form whenever nothing in the tail would need escaping; anything
+	# else (space, quote, $ , backtick, glob) goes through printf %q on the
+	# absolute path, because double quotes alone would still expand $ and
+	# backticks, and ~ cannot be quoted without losing its own expansion.
+	local _tail _shown
+	case "$_p" in
+	"$HOME"/*)
+		_tail=${_p#"$HOME/"}
+		case $_tail in
+		*[!A-Za-z0-9._/-]*) _shown=$(printf '%q' "$_p") ;;
+		*) _shown="~/$_tail" ;;
+		esac
+		;;
+	*) _shown=$(printf '%q' "$_p") ;;
+	esac
+	printf '[[ -f %s ]] && { set -a; source %s; set +a; }\n' "$_shown" "$_shown"
+}
+
 append_env_block() {
-	# append_env_block <marker> <block> [head|normal|tail] — append/guard one
-	# block in every shell env file, then keep the file ordered by block class:
+	# append_env_block <marker> <block> [head|normal|tail] — write one block into
+	# every shell env file, then order that file by block class:
 	#   [head]    env deps other blocks consume (PATH exports, secrets sourcing)
-	#   [normal]  everything else (default; also pre-class content and the user's own lines)
+	#   [normal]  everything else, the user's own lines included (default)
 	#   [tail]    process-replacing exec blocks (tmux / compositor autostart)
-	#             — always last; later appends partition BEFORE them
-	# The class lives in the MARKER LINE's front ("# [tail] marker ..."); dedup
-	# matches on the bare marker text (a substring of annotated lines too), so
-	# pre-class blocks match without duplicating and get annotated on the next
-	# run. Ordering = a stable partition (head, normal, tail; within a class:
-	# appearance order = the install chain's order = the family's dependency
-	# order). Leading content sorts as head. No content matching, no component
-	# coupling: a component declares its own class; the partition is the rule.
+	# The class rides on the marker line ("# [tail] <marker>"), so every
+	# component declares its own placement and none inspects another's text.
+	# Dedup is a substring test on the bare marker: an existing block is never
+	# written twice, and is then left exactly as it is — relabelling an
+	# annotation this installer did not write is not its job.
+	#
+	# The rewrite is a stable partition: head, normal, tail, and within a class
+	# the append order (= the chain's dependency order); anything whose line
+	# carries no class — a block from a pre-class installer, or the user's own
+	# preamble — counts as unmarked and sorts first. It SETS the layout
+	# instead of inheriting it: blank
+	# lines are separators, not content, so exactly one remains between blocks,
+	# none at the top and none after the last line, while blanks inside a block
+	# survive as its text. An already-correct file re-emits byte for byte, which
+	# is what makes the pass idempotent.
 	local marker="$1"
 	local block="$2"
 	local class="${3:-normal}"
@@ -112,21 +158,8 @@ append_env_block() {
 		if ! grep -qF -- "$marker" "$f" 2>/dev/null; then
 			printf '\n# [%s] %s\n%b\n' "$class" "$marker" "$block" >>"$f"
 			ok "Added '$marker' to $f"
-		else
-			# Present: normalize the marker line's class annotation (the
-			# block content stays untouched) — the class must persist in
-			# the file; the partition pass reads it from here.
-			awk -v m="$marker" -v c="$class" '
-				index($0, m) > 0 && $0 ~ /^[[:space:]]*#/ {
-					print "# [" c "] " m
-					next
-				}
-				{ print }
-			' "$f" >"$f.monkey-tmp" && mv "$f.monkey-tmp" "$f"
 		fi
-		# Stable partition: head / normal / tail; within a class the
-		# appearance order is kept; leading content (no marker) sorts as
-		# head. Idempotent: an already-partitioned file re-emits unchanged.
+		# Order the file and normalize its separators (see the rules above).
 		awk '
 			/^[[:space:]]*#[[:space:]]*\[(head|normal|tail)\][[:space:]]/ {
 				nseg++
@@ -140,11 +173,19 @@ append_env_block() {
 				segline[nseg, ++segcnt[nseg]] = $0
 			}
 			END {
+				first = 1
 				for (c = 0; c <= 2; c++)
-					for (sg = 1; sg <= nseg; sg++)
-						if (segcls[sg] == c)
-							for (k = 1; k <= segcnt[sg]; k++)
-								print segline[sg, k]
+					for (sg = 1; sg <= nseg; sg++) {
+						if (segcls[sg] != c) continue
+						lo = 1
+						while (lo <= segcnt[sg] && segline[sg, lo] ~ /^[[:space:]]*$/) lo++
+						hi = segcnt[sg]
+						while (hi >= lo && segline[sg, hi] ~ /^[[:space:]]*$/) hi--
+						if (lo > hi) continue
+						if (!first) print ""
+						first = 0
+						for (k = lo; k <= hi; k++) print segline[sg, k]
+					}
 			}
 		' "$f" >"$f.monkey-tmp" && mv "$f.monkey-tmp" "$f"
 		ENV_BLOCK_FILES="$ENV_BLOCK_FILES $f"
