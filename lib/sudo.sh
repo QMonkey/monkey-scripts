@@ -4,10 +4,11 @@
 SUDOERS_D_DIR="${SUDOERS_D_DIR:-/etc/sudoers.d}"
 SUDO_BIN=""
 # The only sudo state: the grant this process created, empty if it created
-# none. Riding and owning are decided once, when setup_sudo looks at the path —
-# the file is named per project (zz-<PROJECT>-nopasswd), so a chained child of
-# the same project inherits its parent's file and must not delete it mid-run,
-# while a stage that finds nothing usable creates one and then owes its removal.
+# none. Riding and owning are decided once, when setup_sudo asks root about
+# the path — the file is named per project (zz-<PROJECT>-nopasswd), so a
+# chained child of the same project inherits its parent's file and must not
+# delete it mid-run, while a stage that finds nothing usable creates one and
+# then owes its removal.
 # "Did I authenticate?" and "is NOPASSWD in force?" need no flags: the first is
 # invisible to anything downstream and the second is answered by probing sudo
 # itself, so both used to be write-only variables that gated cleanup wrongly.
@@ -72,8 +73,19 @@ setup_sudo() {
 	# created here and cleanup stays out of what someone else is using. A file
 	# sudo will not parse, or none at all, is taken over below: written again,
 	# owned, removed on exit.
-	if [ -e "$(nopasswd_dropin_path)" ] && "$SUDO_BIN" -n true 2>/dev/null; then
-		return 0
+	# Both halves are answered from root's side of the wall: /etc/sudoers.d is
+	# 0750 root:root, so a userland [ -e ] cannot resolve any name inside it
+	# (EACCES reads as "missing") — under that test every chained stage
+	# "created" the shared project file, took ownership of it and deleted it at
+	# exit while its parent still needed it. `sudo -n test -e` stats as root;
+	# the timestamp is then dropped and re-probed because only a rule that
+	# parses can answer without credentials — a cached ticket must not
+	# masquerade as a durable grant.
+	if "$SUDO_BIN" -n test -e "$(nopasswd_dropin_path)" 2>/dev/null; then
+		"$SUDO_BIN" -k 2>/dev/null
+		if "$SUDO_BIN" -n true 2>/dev/null; then
+			return 0
+		fi
 	fi
 	if ! "$SUDO_BIN" -n true 2>/dev/null; then
 		if ! "$SUDO_BIN" -v 2>/dev/null; then
