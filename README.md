@@ -467,7 +467,10 @@ adding it there and giving the tables a row.
 - No sudo keepalive: one password per run. `install.sh` (and a `--install` run
   it chains) installs a per-run NOPASSWD drop-in in `SUDOERS_D_DIR` named
   `zz-<PROJECT>-nopasswd`, verified by discarding the timestamp and re-probing,
-  and the process that authenticated removes it on exit; a manual
+  and the process that wrote it removes it on exit — a chained stage of the
+  same project rides the existing grant instead of writing its own, detecting
+  it from root's side (`sudo -n test -e`) because `SUDOERS_D_DIR` is not
+  readable by the invoking user; a manual
   `checkhealth.sh --install` defaults to `SUDO_DROPIN=0` — one `sudo -v` up
   front and the run rides the timestamp (an expired re-auth inside a retried
   command fails that attempt rather than prompting, see `sudo_cmd`).
