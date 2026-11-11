@@ -386,6 +386,26 @@ write_tty_autostart() {
 }
 
 # ────────────────────── bin dirs / PATH ──────────────────────
+# _path_dir_renderable <dir> — can this text be pasted into a PATH snippet that
+# a login shell will re-parse? Anything that would stop being one literal
+# directory name there is refused at the boundary instead of escaped at render
+# time, which keeps the emitted line byte-identical on every ordinary host: a
+# double quote or a backslash breaks out of the quoting, a backquote or a `$(`
+# runs a command, and a newline splits the line. A bare dollar sign is fine —
+# parameter expansion cannot run anything, and '$HOME/…' is the framework's own
+# idiom. Only environment-derived values reach this check: the framework's own
+# '$HOME/.local/bin' and '${CARGO_HOME:-$HOME/.cargo}/bin' expressions are
+# authored to be expanded by the login shell and are never validated.
+_path_dir_renderable() {
+	local _bad=$'"`\\'
+	# shellcheck disable=SC2016 # the two-character sequence $( is matched
+	# literally here; nothing is substituted at this point.
+	case "$1" in
+	*["$_bad"]* | *'$('* | *$'\n'*) return 1 ;;
+	esac
+	return 0
+}
+
 # _path_prepend_snippet <dir>... — the ONE rendering of a bin_dirs-style
 # idempotent PATH line. ARGUMENT ORDER IS THE RESULTING PATH ORDER ($1 ends up
 # ahead of $2), so callers name dirs high → low like the positional arm of
@@ -413,16 +433,27 @@ _path_prepend_snippet() {
 # Priority (high → low): ~/.local/bin, cargo, go, npm.
 # Consumed only by path_dirs_snippet, which decides what a not-yet-existing
 # dir means for this rendering (it is seeded anyway — future-proofing).
+# This stdout is a DATA channel: persist_path captures it into the profile
+# block verbatim, so a message here must go to stderr or it lands in the
+# sourced file as shell text.
 bin_dirs() {
 	local -a go_dirs=()
 	if [ -n "${GOBIN:-}" ]; then
-		go_dirs+=("$GOBIN")
+		if _path_dir_renderable "$GOBIN"; then
+			go_dirs+=("$GOBIN")
+		else
+			warn "GOBIN $(printf '%q' "$GOBIN") holds a character a login shell would re-parse (quote, backslash, backquote or command substitution) — left out of the PATH block" >&2
+		fi
 	else
 		# Split GOPATH on ':' ONLY (temporarily narrowed IFS — paths with
 		# spaces survive); the escaped default keeps $HOME literal.
 		local gopath_entry old_ifs=$IFS
 		IFS=':'
 		for gopath_entry in ${GOPATH:-\$HOME/go}; do
+			if [ -n "${GOPATH:-}" ] && ! _path_dir_renderable "$gopath_entry"; then
+				warn "GOPATH entry $(printf '%q' "$gopath_entry") holds a character a login shell would re-parse — its bin dir is left out of the PATH block" >&2
+				continue
+			fi
 			go_dirs+=("$gopath_entry/bin")
 		done
 		IFS=$old_ifs
@@ -451,6 +482,10 @@ path_dirs_snippet() {
 	local p
 	for p in $(brew_prefixes); do
 		[ "$p" = /usr/local ] && continue
+		# One of the reported prefixes is derived from PATH through
+		# `command -v brew`, so it gets the same boundary check as the go
+		# dirs; the two literal candidates can never fail it.
+		_path_dir_renderable "$p" || continue
 		_brew_path_snippet "$p/bin" "$p/sbin"
 	done
 	bin_dirs
